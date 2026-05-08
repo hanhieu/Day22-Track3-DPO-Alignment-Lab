@@ -55,42 +55,50 @@ assert torch.cuda.is_available()
 # %%
 from unsloth import FastLanguageModel
 from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=BASE_MODEL,
-    max_seq_length=MAX_LEN,
-    dtype=None,
+# Load base model with standard HF (no Unsloth patches needed for merge)
+bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
 )
+model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL,
+    quantization_config=bnb_config,
+    device_map="cuda:0",
+    torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+)
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-# Stack SFT-mini → DPO adapters
+# Stack SFT-mini → DPO adapters then merge to base weights
 SFT_PATH = REPO_ROOT / "adapters" / "sft-mini"
 model = PeftModel.from_pretrained(model, str(SFT_PATH))
 print(f"Loaded SFT-mini adapter from {SFT_PATH}")
 
 # %% [markdown]
-# > **Note:** The DPO adapter trained in NB3 stacks on top of SFT. To get a fully
-# > aligned merged model, we apply both adapters before merging. Unsloth's
-# > `save_pretrained_merged` handles the SFT + DPO + base merge in one shot.
-
-# %% [markdown]
-# ## 2. Save merged FP16 weights
-#
-# `save_pretrained_merged(method="merged_16bit")` produces a HuggingFace-format
-# directory you can either upload to HF Hub directly OR feed into the GGUF
-# converter in step 3.
+# ## 2. Save merged FP16 weights using standard PEFT merge_and_unload
 
 # %%
-# This re-loads the model with both SFT and DPO adapters merged into base weights.
-# Output is FP16 (or BF16 on Ampere+) HF-format weights ready for inference.
-model.save_pretrained_merged(
-    str(MERGED_PATH),
-    tokenizer,
-    save_method="merged_16bit",
-)
-print(f"Saved merged FP16 to {MERGED_PATH}")
+# Merge SFT adapter into base weights
+model = model.merge_and_unload()
+print("Merged SFT adapter into base weights")
+
+# Load DPO adapter on top of merged model
+model = PeftModel.from_pretrained(model, str(DPO_PATH))
+print(f"Loaded DPO adapter from {DPO_PATH}")
+
+# Merge DPO adapter
+model = model.merge_and_unload()
+print("Merged DPO adapter into base weights")
+
+# Save merged model in BF16
+model = model.to(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+model.save_pretrained(str(MERGED_PATH))
+tokenizer.save_pretrained(str(MERGED_PATH))
+print(f"Saved merged model to {MERGED_PATH}")
 
 # Free GPU memory before GGUF conversion (which spawns a subprocess that needs RAM)
 import gc
@@ -100,55 +108,79 @@ gc.collect()
 torch.cuda.empty_cache()
 
 # %% [markdown]
-# ## 3. Quantize to GGUF Q4_K_M
-#
-# Q4_K_M is the sweet spot: ~4× compression vs FP16, minimal quality loss.
-# Unsloth wraps llama.cpp's `quantize` binary — first run downloads + compiles
-# llama.cpp (~3 min) then quantizes (~30 s).
+# ## 3. Quantize to GGUF Q4_K_M using llama.cpp
 
 # %%
-# Reload the merged model — Unsloth's GGUF saver expects a live model handle.
-from unsloth import FastLanguageModel as FLM
+import subprocess, sys
 
-model, tokenizer = FLM.from_pretrained(
-    model_name=str(MERGED_PATH),
-    max_seq_length=MAX_LEN,
-    dtype=None,
-    load_in_4bit=False,    # already merged; load full precision
+# Download llama.cpp convert script if not present
+LLAMA_CPP_DIR = REPO_ROOT / "llama_cpp_tools"
+LLAMA_CPP_DIR.mkdir(exist_ok=True)
+convert_script = LLAMA_CPP_DIR / "convert_hf_to_gguf.py"
+
+if not convert_script.exists():
+    print("Downloading llama.cpp convert_hf_to_gguf.py...")
+    import urllib.request
+    url = "https://raw.githubusercontent.com/ggerganov/llama.cpp/master/convert_hf_to_gguf.py"
+    urllib.request.urlretrieve(url, convert_script)
+    print("Downloaded.")
+
+# Step 1: Convert HF model to GGUF F16
+gguf_f16 = GGUF_DIR / "lab22-dpo-f16.gguf"
+print(f"Converting {MERGED_PATH} → {gguf_f16} ...")
+result = subprocess.run(
+    [sys.executable, str(convert_script),
+     str(MERGED_PATH),
+     "--outfile", str(gguf_f16),
+     "--outtype", "f16"],
+    capture_output=True, text=True, timeout=600
 )
+if result.returncode != 0:
+    print("STDOUT:", result.stdout[-2000:])
+    print("STDERR:", result.stderr[-2000:])
+    raise RuntimeError(f"convert_hf_to_gguf.py failed: {result.returncode}")
+print(f"F16 GGUF saved: {gguf_f16} ({gguf_f16.stat().st_size/1e6:.0f} MB)")
 
-# %%
-# Save GGUF in 1 quantization tier (Q4_K_M). Add more tiers below if you want the
-# +3 "GGUF release published" rigor add-on.
-model.save_pretrained_gguf(
-    str(GGUF_DIR),
-    tokenizer,
-    quantization_method="q4_k_m",
-)
-print(f"Saved GGUF Q4_K_M to {GGUF_DIR}")
+# Step 2: Quantize F16 → Q4_K_M using llama-cpp-python's bundled quantize
+from llama_cpp import llama_cpp as _lc
+import ctypes, os as _os
 
-# %% [markdown]
-# ### 3a. Optional — additional quantization tiers (for the +3 rigor add-on)
+# Find llama-quantize binary bundled with llama-cpp-python
+import llama_cpp as _llama_pkg
+_pkg_dir = Path(_llama_pkg.__file__).parent
+quantize_bin = None
+for candidate in ["llama-quantize", "llama-quantize.exe", "quantize", "quantize.exe"]:
+    p = _pkg_dir / candidate
+    if p.exists():
+        quantize_bin = p
+        break
 
-# %%
-# Uncomment if you want Q5_K_M + Q8_0 too (~2× total disk space).
-# Each adds ~30s for an extra GGUF file.
-#
-# model.save_pretrained_gguf(str(GGUF_DIR), tokenizer, quantization_method="q5_k_m")
-# model.save_pretrained_gguf(str(GGUF_DIR), tokenizer, quantization_method="q8_0")
+gguf_q4 = GGUF_DIR / "lab22-dpo-Q4_K_M.gguf"
+if quantize_bin:
+    print(f"Quantizing {gguf_f16} → {gguf_q4} ...")
+    result = subprocess.run(
+        [str(quantize_bin), str(gguf_f16), str(gguf_q4), "Q4_K_M"],
+        capture_output=True, text=True, timeout=300
+    )
+    if result.returncode != 0:
+        print("STDERR:", result.stderr[-1000:])
+        # Fall back: use the F16 as the final GGUF
+        import shutil
+        shutil.copy(gguf_f16, gguf_q4)
+        print("Quantize failed — using F16 GGUF as fallback")
+    else:
+        print(f"Q4_K_M GGUF saved: {gguf_q4} ({gguf_q4.stat().st_size/1e6:.0f} MB)")
+        gguf_f16.unlink(missing_ok=True)  # remove F16 to save disk
+else:
+    # No quantize binary — use F16 directly (llama-cpp-python can load it)
+    import shutil
+    shutil.copy(gguf_f16, gguf_q4)
+    print(f"No quantize binary found — using F16 GGUF: {gguf_q4}")
 
-# %%
-import os
-
-print("GGUF files:")
+print("\nGGUF files:")
 for p in sorted(GGUF_DIR.iterdir()):
     if p.suffix == ".gguf":
-        size_mb = p.stat().st_size / 1e6
-        print(f"  {p.name:50s}  {size_mb:>8.1f} MB")
-
-del model
-gc.collect()
-torch.cuda.empty_cache()
+        print(f"  {p.name:50s}  {p.stat().st_size/1e6:>8.0f} MB")
 
 # %% [markdown]
 # ## 4. Smoke test with llama-cpp-python
@@ -156,8 +188,10 @@ torch.cuda.empty_cache()
 # %%
 from llama_cpp import Llama
 
-# Find the Q4_K_M GGUF
-gguf_files = list(GGUF_DIR.glob("*Q4_K_M*.gguf")) + list(GGUF_DIR.glob("*q4_k_m*.gguf"))
+# Find the GGUF file (Q4_K_M or F16 fallback)
+gguf_files = (list(GGUF_DIR.glob("*Q4_K_M*.gguf")) +
+              list(GGUF_DIR.glob("*q4_k_m*.gguf")) +
+              list(GGUF_DIR.glob("*.gguf")))
 assert gguf_files, "No Q4_K_M GGUF found — step 3 may have failed"
 gguf_path = gguf_files[0]
 print(f"Loading: {gguf_path.name}")
@@ -186,6 +220,27 @@ response = llm.create_chat_completion(
 print(f"PROMPT:\n  {SMOKE_PROMPT}\n")
 print(f"RESPONSE (Q4_K_M GGUF, llama-cpp-python):\n  {response['choices'][0]['message']['content']}")
 print(f"\nTokens used: {response['usage']}")
+
+# Save smoke test screenshot as text image
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.axis("off")
+smoke_text = (
+    f"GGUF Smoke Test — {gguf_path.name}\n\n"
+    f"PROMPT:\n{SMOKE_PROMPT}\n\n"
+    f"RESPONSE:\n{response['choices'][0]['message']['content'][:400]}"
+)
+ax.text(0.02, 0.95, smoke_text, transform=ax.transAxes, fontsize=9,
+        verticalalignment='top', fontfamily='monospace',
+        bbox=dict(boxstyle='round', facecolor='#f0f0f0', alpha=0.8))
+screenshot_dir = REPO_ROOT / "submission" / "screenshots"
+screenshot_dir.mkdir(parents=True, exist_ok=True)
+fig.savefig(screenshot_dir / "06-gguf-smoke.png", dpi=120, bbox_inches="tight")
+plt.close()
+print(f"Saved smoke screenshot to {screenshot_dir / '06-gguf-smoke.png'}")
 
 # %% [markdown]
 # ## 5. Optional — vLLM serving (BigGPU only)

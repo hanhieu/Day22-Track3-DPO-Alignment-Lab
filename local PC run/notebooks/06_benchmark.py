@@ -198,9 +198,8 @@ def generate_with_adapter(adapter_path, prompts, max_new_tokens=256):
 
     outputs = []
     for p in prompts:
-        msgs = [{"role": "user", "content": p["prompt"]}]
-        inp = tokenizer.apply_chat_template(msgs, return_tensors="pt",
-                                            add_generation_prompt=True).to("cuda")
+        chat_input = f"<|im_start|>user\n{p['prompt']}<|im_end|>\n<|im_start|>assistant\n"
+        inp = tokenizer(chat_input, return_tensors="pt").input_ids.to("cuda")
         with torch.no_grad():
             out = model.generate(input_ids=inp, max_new_tokens=max_new_tokens,
                                  do_sample=False, pad_token_id=tokenizer.eos_token_id)
@@ -339,6 +338,8 @@ for bench, scores in metrics.items():
     print(f"  {bench:18s}  SFT: {scores['sft']:.3f}   DPO: {scores['dpo']:.3f}   Δ: {delta:+.3f} {arrow}")
 
 # %%
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -381,7 +382,7 @@ fig.tight_layout()
 screenshot_dir = REPO_ROOT / "submission" / "screenshots"
 screenshot_dir.mkdir(parents=True, exist_ok=True)
 fig.savefig(screenshot_dir / "07-benchmark-comparison.png", dpi=120, bbox_inches="tight")
-plt.show()
+plt.close()
 
 # %% [markdown]
 # ## 7. Save results JSON (consumed by `make verify`)

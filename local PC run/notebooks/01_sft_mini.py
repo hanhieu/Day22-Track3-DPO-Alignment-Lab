@@ -41,7 +41,7 @@ else:  # BIGGPU
     PER_DEVICE_BATCH = 2
     GRAD_ACCUM = 4
 
-SFT_DATASET = os.environ.get("SFT_DATASET", "5CD-AI/Vietnamese-alpaca-cleaned")
+SFT_DATASET = os.environ.get("SFT_DATASET", "5CD-AI/Vietnamese-Multi-turn-Chat-Alpaca")
 SFT_SLICE = 1000
 NUM_EPOCHS = 1
 
@@ -114,24 +114,33 @@ from datasets import load_dataset
 
 ds = load_dataset(SFT_DATASET, split=f"train[:{SFT_SLICE}]")
 print(f"Loaded {len(ds)} rows. Columns: {ds.column_names}")
-print(f"\nFirst row:\n{ds[0]}")
+print(f"\nFirst row keys: {list(ds[0].keys())}")
 
 # %%
-# Alpaca → ChatML format (Qwen2.5's native template)
-def format_alpaca_to_chat(row):
-    messages = []
-    if row.get("instruction"):
-        prompt = row["instruction"]
-        if row.get("input"):
-            prompt += "\n\n" + row["input"]
-        messages.append({"role": "user", "content": prompt})
-    if row.get("output"):
-        messages.append({"role": "assistant", "content": row["output"]})
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+# ShareGPT conversations → ChatML format (Qwen2.5's native template)
+# Dataset uses {"conversations": [{"from": "human"/"gpt", "value": "..."}]}
+# We build the ChatML string manually to avoid tokenizer pickling issues in map()
+CHAT_TEMPLATE = "<|im_start|>{role}\n{content}<|im_end|>\n"
+
+def format_sharegpt_to_chat(row):
+    role_map = {"human": "user", "gpt": "assistant", "system": "system"}
+    convs = row.get("conversations") or row.get("conversation") or []
+    text = ""
+    for turn in convs:
+        role = role_map.get(turn.get("from", ""), "user")
+        content = turn.get("value", "").strip()
+        if content:
+            text += CHAT_TEMPLATE.format(role=role, content=content)
+    if not text:
+        return {"text": ""}
+    # Add generation prompt end marker
+    text += "<|im_start|>assistant\n"
     return {"text": text}
 
 
-ds_formatted = ds.map(format_alpaca_to_chat, remove_columns=ds.column_names)
+ds_formatted = ds.map(format_sharegpt_to_chat, remove_columns=ds.column_names)
+ds_formatted = ds_formatted.filter(lambda x: len(x["text"]) > 50)
+print(f"\nFormatted: {len(ds_formatted)} rows")
 print(f"\nSample formatted text (first 500 chars):\n{ds_formatted[0]['text'][:500]}")
 
 # %% [markdown]
@@ -174,22 +183,22 @@ print(f"\nFinal train loss: {train_result.training_loss:.4f}")
 # ### 3a. Plot loss curve (deliverable: `02_sft_loss.png`)
 
 # %%
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-losses = [log["loss"] for log in trainer.state.log_history if "loss" in log]
 steps = [log["step"] for log in trainer.state.log_history if "loss" in log]
 
 fig, ax = plt.subplots(figsize=(8, 4))
 ax.plot(steps, losses, marker="o", markersize=3, linewidth=1.2)
 ax.set_xlabel("Training step")
 ax.set_ylabel("Loss")
-ax.set_title(f"SFT-mini loss · {COMPUTE_TIER} · {BASE_MODEL.split('/')[-1]} · {SFT_SLICE} samples")
+ax.set_title(f"SFT-mini loss | {COMPUTE_TIER} | {BASE_MODEL.split('/')[-1]} | {SFT_SLICE} samples")
 ax.grid(True, alpha=0.3)
 fig.tight_layout()
 screenshot_dir = REPO_ROOT / "submission" / "screenshots"
 screenshot_dir.mkdir(parents=True, exist_ok=True)
 fig.savefig(screenshot_dir / "02-sft-loss.png", dpi=120)
-plt.show()
+plt.close()
 
 # %% [markdown]
 # ## 4. Save adapter + sanity-check generation
@@ -202,11 +211,10 @@ print(f"Saved SFT adapter to {ADAPTER_OUT}")
 # %%
 # Sanity: generate 1 sample to confirm the adapter loaded correctly.
 FastLanguageModel.for_inference(model)
-prompt = "Giải thích ngắn gọn (3-4 câu) thuật toán quicksort hoạt động thế nào."
-messages = [{"role": "user", "content": prompt}]
-inputs = tokenizer.apply_chat_template(
-    messages, return_tensors="pt", add_generation_prompt=True
-).to("cuda")
+prompt = "Giai thich ngan gon (3-4 cau) thuat toan quicksort hoat dong the nao."
+# Build ChatML prompt manually (avoids tokenizer.chat_template dependency)
+chat_input = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+inputs = tokenizer(chat_input, return_tensors="pt").input_ids.to("cuda")
 with torch.no_grad():
     out = model.generate(input_ids=inputs, max_new_tokens=200, do_sample=False)
 generated = tokenizer.decode(out[0][inputs.shape[1]:], skip_special_tokens=True)

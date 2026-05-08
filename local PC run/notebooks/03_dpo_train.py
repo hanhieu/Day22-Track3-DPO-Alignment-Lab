@@ -74,41 +74,49 @@ assert torch.cuda.is_available(), "DPO needs a CUDA GPU. See HARDWARE-GUIDE.md."
 # is shared across copies — only the LoRA adapter differs.
 
 # %%
-from unsloth import FastLanguageModel
-from peft import PeftModel
+from peft import PeftModel, get_peft_model, LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-# Policy — gets new DPO LoRA adapter on top of SFT LoRA
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=BASE_MODEL,
-    max_seq_length=MAX_LEN,
-    dtype=None,
+# Load with standard HuggingFace (not Unsloth's patched forward) to avoid
+# xformers BMGHK backward error in DPO's concatenated_forward.
+bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+    bnb_4bit_use_double_quant=True,
 )
+
+model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL,
+    quantization_config=bnb_config,
+    device_map="cuda:0",
+    attn_implementation="sdpa",   # PyTorch SDPA — supports BMGHK backward
+    torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+)
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"
 
-# Load SFT adapter on top of base
+# Load SFT adapter
 model = PeftModel.from_pretrained(model, str(SFT_PATH), is_trainable=True)
 print(f"Policy: {model.__class__.__name__} with SFT adapter loaded")
 
 # %%
-# Wrap policy with NEW LoRA adapter for DPO updates (don't merge SFT — keep stacked)
-# Unsloth re-applies LoRA on top of the existing PeftModel.
-model = FastLanguageModel.get_peft_model(
-    model,
+# Add new DPO LoRA adapter on top of SFT adapter using standard PEFT
+from peft import LoraConfig, get_peft_model
+
+lora_config = LoraConfig(
     r=16,
     lora_alpha=32,
     lora_dropout=0.0,
     bias="none",
-    target_modules=[
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj",
-    ],
-    use_gradient_checkpointing="unsloth",
-    random_state=42,
-    use_rslora=False,
-    loftq_config=None,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    task_type="CAUSAL_LM",
 )
+model = get_peft_model(model, lora_config)
+model.enable_input_require_grads()
 print(f"Trainable params (DPO LoRA): {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
 # %% [markdown]
@@ -122,6 +130,12 @@ print(f"Trainable params (DPO LoRA): {sum(p.numel() for p in model.parameters() 
 
 # %%
 from trl import DPOConfig
+
+# Disable Unsloth's custom DPO trainer — its xformers attention doesn't support
+# the BMGHK format used in DPO's concatenated_forward on this platform.
+# Standard TRL DPOTrainer with PyTorch SDPA works correctly.
+import os as _os
+_os.environ["UNSLOTH_DISABLE_PATCHING"] = "1"
 
 dpo_config = DPOConfig(
     output_dir=str(DPO_OUT.parent / "dpo-checkpoints"),
@@ -187,6 +201,8 @@ print(f"\nFinal DPO loss: {train_result.training_loss:.4f}")
 # improve actual chosen probability.
 
 # %%
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -221,13 +237,13 @@ else:
                  ha="center", va="center", transform=axes[0].transAxes)
     axes[1].text(0.5, 0.5, "—", ha="center", va="center", transform=axes[1].transAxes)
 
-fig.suptitle(f"DPO reward curves · {COMPUTE_TIER} · β={BETA} · lr={LR}", y=1.02)
+fig.suptitle(f"DPO reward curves | {COMPUTE_TIER} | beta={BETA} | lr={LR}", y=1.02)
 fig.tight_layout()
 
 screenshot_dir = REPO_ROOT / "submission" / "screenshots"
 screenshot_dir.mkdir(parents=True, exist_ok=True)
 fig.savefig(screenshot_dir / "03-dpo-reward-curves.png", dpi=120, bbox_inches="tight")
-plt.show()
+plt.close()
 
 # %% [markdown]
 # ### 5a. Failure-mode self-check
@@ -272,6 +288,9 @@ print(f"Saved DPO adapter to {DPO_OUT}")
 
 # Save the headline metrics for verify.py + REFLECTION
 import json
+
+# Initialize with defaults in case reward cols aren't available
+last_chosen = last_rejected = last_gap = None
 
 metrics = {
     "compute_tier": COMPUTE_TIER,

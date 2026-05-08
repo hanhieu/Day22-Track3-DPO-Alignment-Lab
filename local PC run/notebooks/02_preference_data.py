@@ -88,11 +88,11 @@ print(f"Loaded {len(ds)} pairs. Columns: {ds.column_names}")
 # include the chat template tokens — Trainer doesn't apply template internally.
 
 # %%
+# ChatML template string — avoids tokenizer pickling issues in datasets.map()
+CHATML_USER = "<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
+
 def format_pref(row):
-    prompt_msgs = [{"role": "user", "content": row["prompt"]}]
-    prompt_text = tokenizer.apply_chat_template(
-        prompt_msgs, tokenize=False, add_generation_prompt=True
-    )
+    prompt_text = CHATML_USER.format(content=row["prompt"])
     # `chosen` and `rejected` in this dataset are list-of-dicts with role/content.
     # Take just the assistant turn text (last message).
     chosen_text = row["chosen"][-1]["content"] if isinstance(row["chosen"], list) else row["chosen"]
